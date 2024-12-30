@@ -514,7 +514,7 @@ int arc_jtag_read_memory(struct arc_jtag *jtag_info, uint32_t addr,
 		 * this issue we need to do totally non-required address
 		 * writes, which however resolve a problem by introducing
 		 * delay. See STAR 9000832538... */
-		if (slow_memory || i == 0) {
+		if (i == 0) {
 		    /* Set address */
 		    arc_jtag_enque_write_ir(jtag_info, ARC_JTAG_ADDRESS_REG);
 		    arc_jtag_enque_write_dr(jtag_info, addr + i * 4, TAP_IDLE);
