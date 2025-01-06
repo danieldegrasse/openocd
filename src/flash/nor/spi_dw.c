@@ -59,12 +59,17 @@
 #define BAUDR 0x14
 #define BAUDR_SCKDV(x) ((x) & 0xFFFF)
 
+#define TXFTLR 0x18
+
+#define RXFTLR 0x1c
+
 #define TXFLR 0x20
 
 #define RXFLR 0x24
 
 #define SR 0x28
 #define SR_BUSY_MASK BIT(0)
+#define SR_RFF_MASK BIT(4)
 
 #define IMR 0x2c
 #define IMR_MSTIM_MASK BIT(5)
@@ -88,6 +93,9 @@ struct spi_dw_info {
 	uint32_t regs_base;
 	uint16_t sclk_div;
 	bool probed;
+	struct flash_device fdev;
+	uint32_t tx_abw;
+	uint32_t rx_abw;
 };
 
 /* Helper function to write to IP register */
@@ -110,13 +118,26 @@ static int spi_dw_read_reg(struct flash_bank *bank, uint32_t offset,
 	return target_read_u32(target, spi_dw_info->regs_base + offset, val);
 }
 
+/* Helper function to byte swap flash address */
+static void swap_addr(uint32_t addr, unsigned int addr_len, uint8_t *buffer)
+{
+	for (buffer += addr_len; addr_len > 0; --addr_len) {
+		*--buffer = addr;
+		addr >>= 8;
+	}
+}
+
 /* Helper to write command and address, then read data */
 static int spi_dw_read_addr(struct flash_bank *bank, uint8_t cmd,
 			    uint8_t *addr_buf, size_t addr_len,
 			    uint8_t *data_buf, size_t data_len)
 {
-	int rc;
+	struct spi_dw_info *spi_dw_info = bank->driver_priv;
+	uint32_t *int_buf = NULL;
+	int rc, exit_ret;
 	uint32_t reg;
+	size_t rd_offset = 0;
+	size_t rd_len = 0;
 
 	/*
 	 * Configure SPI into eeprom mode, and configure length of data to
@@ -134,6 +155,10 @@ static int spi_dw_read_addr(struct flash_bank *bank, uint8_t cmd,
 	if (rc != ERROR_OK)
 		return rc;
 	reg &= ~(CTRLR1_NDF_MASK);
+	if (data_len > CTRLR1_NDF_MASK) {
+		LOG_ERROR("DW SPI cannot support read of %ld bytes", data_len);
+		return ERROR_FAIL;
+	}
 	reg |= CTRLR1_NDF(data_len - 1);
 	rc = spi_dw_write_reg(bank, CTRLR1, reg);
 	if (rc != ERROR_OK)
@@ -142,64 +167,107 @@ static int spi_dw_read_addr(struct flash_bank *bank, uint8_t cmd,
 	/* Enable SPI */
 	rc = spi_dw_write_reg(bank, SSIENR, 0x1);
 	if (rc != ERROR_OK)
-		return rc;
+		goto out;
+
+	if (spi_dw_info->tx_abw < (1 + addr_len)) {
+		/* Can't perform this transfer, TX FIFO is too small */
+		LOG_ERROR("Cannot perform transfer, HW TX FIFO is too small");
+		return ERROR_FAIL;
+	}
 
 	/* Fill TX FIFO */
 	rc = spi_dw_write_reg(bank, DR0, cmd);
 	if (rc != ERROR_OK)
-		return rc;
+		goto out;
 	for (size_t i = 0; i < addr_len; i++) {
 		reg = addr_buf[i] & 0xff;
 		/* Write to DR to push to FIFO */
 		rc = spi_dw_write_reg(bank, DR0, reg);
 		if (rc != ERROR_OK)
-			return rc;
+			goto out;
+	}
+
+	int_buf = malloc(spi_dw_info->rx_abw * 4);
+	if (!int_buf) {
+		rc = ERROR_FAIL;
+		goto out;
 	}
 
 	/* Set SER to enable chip select and start transfer */
 	rc = spi_dw_write_reg(bank, SER, 0x1);
 	if (rc != ERROR_OK)
-		return rc;
+		goto out;
 
-	do {
-		/* Poll the status register busy bit */
+	while (data_len > 0) {
+		rc = spi_dw_read_reg(bank, RXFLR, &reg); if (rc != ERROR_OK)
+			goto out;
+		/*
+		 * This is a ugly hack- the JTAG read on the ARC is buggy, and
+		 * will issue a second AXI read at the next address when
+		 * accessing the data register. We work around this by always
+		 * reading all 36 data registers, so the extra read just goes
+		 * to an invalid address and is ignored.
+		 *
+		 * Therefore, we *must* wait for the RX FIFO to have at least
+		 * 36 entries if we want all 36 bytes to be valid.
+		 */
+		rd_len = MIN(36, reg);
+
 		rc = spi_dw_read_reg(bank, SR, &reg);
 		if (rc != ERROR_OK)
-			return rc;
-	} while (reg & SR_BUSY_MASK);
+			goto out;
+		if (reg & SR_RFF_MASK) {
+			LOG_ERROR("RX FIFO overflowed. You likely need to "
+				  "increase your baud rate divider");
+			rc = ERROR_FAIL;
+			goto out;
+		}
 
-	/* Wait for data in the RX FIFO */
-	do {
+		if ((rd_len != data_len) && (rd_len != 36)) {
+			continue;
+		}
+
+		/* Read data clocked in */
+		rc = target_read_memory(bank->target, 0x80070060, 0x4, 36,
+					(uint8_t *)int_buf);
+		if (rc != ERROR_OK)
+			goto out;
+		for (size_t i = 0; i < rd_len; i++) {
+			data_buf[rd_offset++] = int_buf[i] & 0xFF;
+		}
+
+		data_len -= rd_len;
+	}
+
+out:
+	exit_ret = rc;
+	if (int_buf)
+		free(int_buf);
+
+	/* Clear RX FIFO */
+	while (1) {
 		rc = spi_dw_read_reg(bank, RXFLR, &reg);
 		if (rc != ERROR_OK)
 			return rc;
-	} while (reg == 0x0);
-
-
-	uint32_t *int_buf = malloc(data_len * 4);
-	if (!int_buf)
-		return ERROR_FAIL;
-	/* Read data clocked in */
-	rc = target_read_memory(bank->target, 0x80070060, 0x4, data_len,
-				(uint8_t *)int_buf);
-	if (rc != ERROR_OK)
-		return rc;
-	for (size_t i = 0; i < data_len; i++) {
-		data_buf[i] = int_buf[i] & 0xFF;
+		if (reg == 0)
+			break;
+		rc = spi_dw_read_reg(bank, DR0, &reg);
+		if (rc != ERROR_OK)
+			return rc;
 	}
 
-	free(int_buf);
 
 	/* Disable SPI */
 	rc = spi_dw_write_reg(bank, SSIENR, 0x0);
 	if (rc != ERROR_OK)
+		return rc;
 
 	/* Clear SER */
 	rc = spi_dw_write_reg(bank, SER, 0x0);
 	if (rc != ERROR_OK)
 		return rc;
 
-	return ERROR_OK;
+	return exit_ret;
 }
 
 // /* Helper to simulanously transmit and receive from SPI*/
@@ -279,22 +347,14 @@ static int spi_dw_read_addr(struct flash_bank *bank, uint8_t cmd,
 
 static int spi_dw_read_id(struct flash_bank *bank, uint32_t *id)
 {
-	int rc;
-	uint8_t tmp[3];
 	/* Read JEDEC ID from flash */
-	rc = spi_dw_read_addr(bank, SPIFLASH_READ_ID, NULL, 0,tmp, 3);
-	if (rc != ERROR_OK)
-		return rc;
-	/* Swap bytes */
-	*id = tmp[0] << 16;
-	*id |= tmp[1] << 8;
-	*id |= tmp[2];
-	return ERROR_OK;
+	return spi_dw_read_addr(bank, SPIFLASH_READ_ID, NULL, 0, (uint8_t *)id, 3);
 }
 
 static int spi_dw_probe(struct flash_bank *bank)
 {
 	struct spi_dw_info *spi_dw_info = bank->driver_priv;
+	const struct flash_device *fdev;
 	int rc;
 	uint32_t reg, dev_id;
 	char *version_str = (char *)&reg;
@@ -305,6 +365,36 @@ static int spi_dw_probe(struct flash_bank *bank)
 		return rc;
 	LOG_DEBUG("Found SPI DW IP revision %c.%c.%c%c", version_str[0],
 			  version_str[1], version_str[2], version_str[3]);
+
+	/* Probe the SPI flash to determine the RX and TX fifo size */
+	spi_dw_info->tx_abw = 512;
+	spi_dw_info->rx_abw = 512;
+	do {
+		spi_dw_info->rx_abw >>= 1;
+		reg = spi_dw_info->rx_abw - 1;
+		rc = spi_dw_write_reg(bank, RXFTLR, reg);
+		if (rc != ERROR_OK)
+			return rc;
+		/* Read back value */
+		rc = spi_dw_read_reg(bank, RXFTLR, &reg);
+		if (rc != ERROR_OK)
+			return rc;
+	} while (reg != (spi_dw_info->rx_abw - 1));
+
+	do {
+		spi_dw_info->tx_abw >>= 1;
+		reg = spi_dw_info->tx_abw - 1;
+		rc = spi_dw_write_reg(bank, TXFTLR, reg);
+		if (rc != ERROR_OK)
+			return rc;
+		/* Read back value */
+		rc = spi_dw_read_reg(bank, TXFTLR, &reg);
+		if (rc != ERROR_OK)
+			return rc;
+	} while (reg != (spi_dw_info->tx_abw - 1));
+
+	LOG_DEBUG("SPI TX_ABW: %d, RX_ABW: %d", spi_dw_info->tx_abw,
+		  spi_dw_info->rx_abw);
 
 	/*
 	 * Configure SPI DW instance for polling access, using serial
@@ -380,7 +470,40 @@ static int spi_dw_probe(struct flash_bank *bank)
 		return rc;
 	LOG_DEBUG("SPI Flash ID: 0x%03X", dev_id);
 
+	for (fdev = flash_devices; fdev->name != NULL; fdev++) {
+		if (fdev->device_id == dev_id) {
+			memcpy(&spi_dw_info->fdev, fdev, sizeof(spi_dw_info->fdev));
+			LOG_INFO("flash \'%s\' id = 0x%06" PRIx32 " size = %" PRIu32
+				 " kbytes", fdev->name, dev_id, fdev->size_in_bytes / 1024);
+			break;
+		}
+	}
 
+	if (fdev->name == NULL) {
+		LOG_ERROR("Flash device was not recognized");
+		return ERROR_FAIL;
+	}
+
+	bank->size = fdev->size_in_bytes;
+	bank->write_start_alignment = FLASH_WRITE_ALIGN_SECTOR;
+	bank->write_end_alignment = FLASH_WRITE_ALIGN_SECTOR;
+
+	/* Create sectors array */
+	bank->num_sectors = fdev->size_in_bytes / fdev->sectorsize;
+	if (bank->sectors)
+		free(bank->sectors);
+	bank->sectors = malloc(bank->num_sectors * sizeof(struct flash_sector));
+	if (!bank->sectors) {
+		LOG_ERROR("Not enough memory");
+		return ERROR_FAIL;
+	}
+
+	for (unsigned int sector = 0; sector < bank->num_sectors; sector++) {
+		bank->sectors[sector].offset = sector * fdev->sectorsize;
+		bank->sectors[sector].size = fdev->sectorsize;
+		bank->sectors[sector].is_erased = -1;
+		bank->sectors[sector].is_protected = 0;
+	}
 
 	spi_dw_info->probed = true;
 
@@ -400,7 +523,37 @@ static int spi_dw_auto_probe(struct flash_bank *bank)
 static int spi_dw_read(struct flash_bank *bank, uint8_t *buffer,
 		       uint32_t offset, uint32_t count)
 {
-	return ERROR_FAIL;
+	struct spi_dw_info *spi_dw_info = bank->driver_priv;
+	struct flash_device *fdev = &spi_dw_info->fdev;
+	const uint8_t addr_len = (fdev->read_cmd == 0x13) ? 4 : 3;
+	size_t rd_count, rd_offset = 0;
+	int rc;
+	uint8_t addr[4];
+
+
+	if (count > CTRLR1_NDF_MASK) {
+		/*
+		 * Can't support a read this large in one call. Split the
+		 * SPI access into multiple reads
+		 */
+		while (count > 0) {
+			rd_count = MIN(count, CTRLR1_NDF_MASK);
+			swap_addr(offset, addr_len, addr);
+
+			rc = spi_dw_read_addr(bank, fdev->read_cmd, addr,
+					      addr_len, &buffer[rd_offset], rd_count);
+			if (rc != ERROR_OK)
+				return rc;
+			count -= rd_count;
+			rd_offset += rd_count;
+			offset += rd_count;
+		}
+	} else {
+		swap_addr(offset, addr_len, addr);
+		rc = spi_dw_read_addr(bank, fdev->read_cmd, addr,
+				      addr_len, buffer, count);
+	}
+	return rc;
 }
 
 FLASH_BANK_COMMAND_HANDLER(spi_dw_flash_bank_command)
