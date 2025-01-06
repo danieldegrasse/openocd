@@ -89,6 +89,8 @@
 
 #define RX_SAMPLE_DLY 0xf0
 
+#define SPI_DW_DR_SIZE 36
+
 struct spi_dw_info {
 	uint32_t regs_base;
 	uint16_t sclk_div;
@@ -133,7 +135,7 @@ static int spi_dw_read_addr(struct flash_bank *bank, uint8_t cmd,
 			    uint8_t *data_buf, size_t data_len)
 {
 	struct spi_dw_info *spi_dw_info = bank->driver_priv;
-	uint32_t *int_buf = NULL;
+	uint32_t int_buf[SPI_DW_DR_SIZE];
 	int rc, exit_ret;
 	uint32_t reg;
 	size_t rd_offset = 0;
@@ -155,7 +157,7 @@ static int spi_dw_read_addr(struct flash_bank *bank, uint8_t cmd,
 	if (rc != ERROR_OK)
 		return rc;
 	reg &= ~(CTRLR1_NDF_MASK);
-	if (data_len > CTRLR1_NDF_MASK) {
+	if (data_len > (CTRLR1_NDF_MASK + 1)) {
 		LOG_ERROR("DW SPI cannot support read of %ld bytes", data_len);
 		return ERROR_FAIL;
 	}
@@ -187,12 +189,6 @@ static int spi_dw_read_addr(struct flash_bank *bank, uint8_t cmd,
 			goto out;
 	}
 
-	int_buf = malloc(spi_dw_info->rx_abw * 4);
-	if (!int_buf) {
-		rc = ERROR_FAIL;
-		goto out;
-	}
-
 	/* Set SER to enable chip select and start transfer */
 	rc = spi_dw_write_reg(bank, SER, 0x1);
 	if (rc != ERROR_OK)
@@ -211,7 +207,7 @@ static int spi_dw_read_addr(struct flash_bank *bank, uint8_t cmd,
 		 * Therefore, we *must* wait for the RX FIFO to have at least
 		 * 36 entries if we want all 36 bytes to be valid.
 		 */
-		rd_len = MIN(36, reg);
+		rd_len = MIN(SPI_DW_DR_SIZE, reg);
 
 		rc = spi_dw_read_reg(bank, SR, &reg);
 		if (rc != ERROR_OK)
@@ -223,13 +219,13 @@ static int spi_dw_read_addr(struct flash_bank *bank, uint8_t cmd,
 			goto out;
 		}
 
-		if ((rd_len != data_len) && (rd_len != 36)) {
+		if ((rd_len != data_len) && (rd_len != SPI_DW_DR_SIZE)) {
 			continue;
 		}
 
 		/* Read data clocked in */
-		rc = target_read_memory(bank->target, 0x80070060, 0x4, 36,
-					(uint8_t *)int_buf);
+		rc = target_read_memory(bank->target, 0x80070060, 0x4,
+					SPI_DW_DR_SIZE, (uint8_t *)int_buf);
 		if (rc != ERROR_OK)
 			goto out;
 		for (size_t i = 0; i < rd_len; i++) {
@@ -241,8 +237,6 @@ static int spi_dw_read_addr(struct flash_bank *bank, uint8_t cmd,
 
 out:
 	exit_ret = rc;
-	if (int_buf)
-		free(int_buf);
 
 	/* Clear RX FIFO */
 	while (1) {
@@ -269,81 +263,6 @@ out:
 
 	return exit_ret;
 }
-
-// /* Helper to simulanously transmit and receive from SPI*/
-// static int spi_dw_txrx(struct flash_bank *bank, uint8_t *wr_buf,
-// 		       uint8_t *rd_buf, size_t len)
-// {
-// 	int rc;
-// 	uint32_t reg;
-//
-// 	/* Enable SPI */
-// 	rc = spi_dw_write_reg(bank, SSIENR, 0x1);
-// 	if (rc != ERROR_OK)
-// 		return rc;
-//
-// 	/* Flush any data in the RX FIFO */
-// 	do {
-// 		rc = spi_dw_read_reg(bank, DR0, &reg);
-// 		if (rc != ERROR_OK)
-// 			return rc;
-// 		rc = spi_dw_read_reg(bank, RXFLR, &reg);
-// 		if (rc != ERROR_OK)
-// 			return rc;
-// 	} while (reg != 0x0);
-//
-// 	/* Fill TX FIFO */
-// 	for (size_t i = 0; i < len; i++) {
-// 		/* Write to DR to push to FIFO */
-// 		rc = spi_dw_write_reg(bank, DR0, ((uint32_t) wr_buf[i]));
-// 		if (rc != ERROR_OK)
-// 			return rc;
-// 	}
-//
-// 	/* Set SER to enable chip select and start transfer */
-// 	rc = spi_dw_write_reg(bank, SER, 0x1);
-// 	if (rc != ERROR_OK)
-// 		return rc;
-//
-// 	do {
-// 		/* Poll the status register busy bit */
-// 		rc = spi_dw_read_reg(bank, SR, &reg);
-// 		if (rc != ERROR_OK)
-// 			return rc;
-// 	} while (reg & SR_BUSY_MASK);
-//
-// 	/* Wait for data in the RX FIFO */
-// 	do {
-// 		rc = spi_dw_read_reg(bank, RXFLR, &reg);
-// 		if (rc != ERROR_OK)
-// 			return rc;
-// 	} while (reg == 0x0);
-//
-//
-// 	uint32_t *int_buf = malloc(len * 4);
-// 	if (!int_buf)
-// 		return ERROR_FAIL;
-// 	/* Read data clocked in */
-// 	rc = target_read_memory(bank->target, 0x80070060, 0x4, len, (uint8_t *)int_buf);
-// 	if (rc != ERROR_OK)
-// 		return rc;
-// 	for (size_t i = 0; i < len; i++) {
-// 		rd_buf[i] = int_buf[i] & 0xFF;
-// 	}
-//
-// 	free(int_buf);
-//
-// 	/* Disable SPI */
-// 	rc = spi_dw_write_reg(bank, SSIENR, 0x0);
-// 	if (rc != ERROR_OK)
-//
-// 	/* Clear SER */
-// 	rc = spi_dw_write_reg(bank, SER, 0x0);
-// 	if (rc != ERROR_OK)
-// 		return rc;
-//
-// 	return ERROR_OK;
-// }
 
 static int spi_dw_read_id(struct flash_bank *bank, uint32_t *id)
 {
@@ -537,7 +456,7 @@ static int spi_dw_read(struct flash_bank *bank, uint8_t *buffer,
 		 * SPI access into multiple reads
 		 */
 		while (count > 0) {
-			rd_count = MIN(count, CTRLR1_NDF_MASK);
+			rd_count = MIN(count, CTRLR1_NDF_MASK + 1);
 			swap_addr(offset, addr_len, addr);
 
 			rc = spi_dw_read_addr(bank, fdev->read_cmd, addr,
