@@ -69,6 +69,7 @@
 
 #define SR 0x28
 #define SR_BUSY_MASK BIT(0)
+#define SR_TFE_MASK BIT(2)
 #define SR_RFF_MASK BIT(4)
 
 #define IMR 0x2c
@@ -141,6 +142,9 @@ static int spi_dw_read_addr(struct flash_bank *bank, uint8_t cmd,
 	size_t rd_offset = 0;
 	size_t rd_len = 0;
 
+	LOG_DEBUG("CMD: 0x%X, addr_len %ld, data_len %ld", cmd,
+		  addr_len, data_len);
+
 	/*
 	 * Configure SPI into eeprom mode, and configure length of data to
 	 * receive
@@ -166,16 +170,16 @@ static int spi_dw_read_addr(struct flash_bank *bank, uint8_t cmd,
 	if (rc != ERROR_OK)
 		return rc;
 
-	/* Enable SPI */
-	rc = spi_dw_write_reg(bank, SSIENR, 0x1);
-	if (rc != ERROR_OK)
-		goto out;
-
 	if (spi_dw_info->tx_abw < (1 + addr_len)) {
 		/* Can't perform this transfer, TX FIFO is too small */
 		LOG_ERROR("Cannot perform transfer, HW TX FIFO is too small");
 		return ERROR_FAIL;
 	}
+
+	/* Enable SPI */
+	rc = spi_dw_write_reg(bank, SSIENR, 0x1);
+	if (rc != ERROR_OK)
+		goto out;
 
 	/* Fill TX FIFO */
 	rc = spi_dw_write_reg(bank, DR0, cmd);
@@ -194,8 +198,9 @@ static int spi_dw_read_addr(struct flash_bank *bank, uint8_t cmd,
 	if (rc != ERROR_OK)
 		goto out;
 
-	while (data_len > 0) {
-		rc = spi_dw_read_reg(bank, RXFLR, &reg); if (rc != ERROR_OK)
+	while (rd_offset < data_len) {
+		rc = spi_dw_read_reg(bank, RXFLR, &reg);
+		if (rc != ERROR_OK)
 			goto out;
 		/*
 		 * This is a ugly hack- the JTAG read on the ARC is buggy, and
@@ -219,20 +224,24 @@ static int spi_dw_read_addr(struct flash_bank *bank, uint8_t cmd,
 			goto out;
 		}
 
-		if ((rd_len != data_len) && (rd_len != SPI_DW_DR_SIZE)) {
+		if ((rd_len != (data_len - rd_offset)) &&
+		    (rd_len != SPI_DW_DR_SIZE)) {
 			continue;
 		}
 
 		/* Read data clocked in */
-		rc = target_read_memory(bank->target, 0x80070060, 0x4,
+		rc = target_read_memory(bank->target,
+					spi_dw_info->regs_base + DR0, 0x4,
 					SPI_DW_DR_SIZE, (uint8_t *)int_buf);
 		if (rc != ERROR_OK)
 			goto out;
 		for (size_t i = 0; i < rd_len; i++) {
 			data_buf[rd_offset++] = int_buf[i] & 0xFF;
+			if ((rd_offset % 0x10000) == 0) {
+				LOG_INFO("Reading offset 0x%lx/0x%lx", rd_offset,
+					 data_len);
+			}
 		}
-
-		data_len -= rd_len;
 	}
 
 out:
@@ -250,6 +259,108 @@ out:
 			return rc;
 	}
 
+	/* Disable SPI */
+	rc = spi_dw_write_reg(bank, SSIENR, 0x0);
+	if (rc != ERROR_OK)
+		return rc;
+
+	/* Clear SER */
+	rc = spi_dw_write_reg(bank, SER, 0x0);
+	if (rc != ERROR_OK)
+		return rc;
+
+	return exit_ret;
+}
+
+/* Helper to write command and address, then write data */
+static int spi_dw_write_addr(struct flash_bank *bank, uint8_t cmd,
+			     uint8_t *addr_buf, size_t addr_len,
+			     uint8_t *data_buf, size_t data_len)
+{
+	struct spi_dw_info *spi_dw_info = bank->driver_priv;
+	uint32_t int_buf[SPI_DW_DR_SIZE];
+	int rc, exit_ret;
+	uint32_t reg;
+	size_t write_offset = 0;
+	size_t write_len;
+
+	LOG_DEBUG("CMD: 0x%X, addr_len %ld, data_len %ld", cmd,
+		  addr_len, data_len);
+
+	/* Configure SPI into TX only mode, no RX */
+	rc = spi_dw_read_reg(bank, CTRLR0, &reg);
+	if (rc != ERROR_OK)
+		return rc;
+	reg &= ~(CTRLR0_TMOD_MASK);
+	reg |= CTRLR0_TMOD(0x1);
+	rc = spi_dw_write_reg(bank, CTRLR0, reg);
+	if (rc != ERROR_OK)
+		return rc;
+
+	/* Now, write command and address */
+	if (spi_dw_info->tx_abw < (1 + addr_len)) {
+		/* Can't perform this transfer, TX FIFO is too small */
+		LOG_ERROR("Cannot perform transfer, HW TX FIFO is too small");
+		return ERROR_FAIL;
+	}
+
+	/* Enable SPI */
+	rc = spi_dw_write_reg(bank, SSIENR, 0x1);
+	if (rc != ERROR_OK)
+		goto out;
+
+	rc = spi_dw_write_reg(bank, DR0, cmd);
+	if (rc != ERROR_OK)
+		goto out;
+	for (size_t i = 0; i < addr_len; i++) {
+		reg = addr_buf[i] & 0xff;
+		/* Write to DR to push to FIFO */
+		rc = spi_dw_write_reg(bank, DR0, reg);
+		if (rc != ERROR_OK)
+			goto out;
+	}
+
+	/* Set SER to enable chip select and start transfer */
+	rc = spi_dw_write_reg(bank, SER, 0x1);
+	if (rc != ERROR_OK)
+		goto out;
+
+	while (write_offset < data_len) {
+		rc = spi_dw_read_reg(bank, SR, &reg);
+		if (rc != ERROR_OK)
+			goto out;
+		if (reg & SR_TFE_MASK) {
+			LOG_ERROR("Transmit FIFO underflowed. You likely need "
+				  "to increase your baud rate divider");
+			rc = ERROR_FAIL;
+			goto out;
+		}
+		/* Read TX fifo level */
+		rc = spi_dw_read_reg(bank, TXFLR, &reg);
+		if (rc != ERROR_OK)
+			goto out;
+		write_len = spi_dw_info->tx_abw - reg;
+		for (size_t i = 0; i < write_len; i++) {
+			int_buf[i] = data_buf[i + write_offset];
+		}
+		/* Now perform a bulk write to the DR array */
+		rc = target_write_memory(bank->target,
+					 spi_dw_info->regs_base + DR0,
+					 0x4, write_len, (uint8_t *)int_buf);
+		if (rc != ERROR_OK)
+			goto out;
+		write_offset += write_len;
+	}
+
+out:
+	exit_ret = rc;
+
+	/* Wait for BUSY bit to clear */
+	do {
+		rc = spi_dw_read_reg(bank, SR, &reg);
+		if (rc != ERROR_OK)
+			return rc;
+	} while (reg & SR_BUSY_MASK);
 
 	/* Disable SPI */
 	rc = spi_dw_write_reg(bank, SSIENR, 0x0);
@@ -268,6 +379,62 @@ static int spi_dw_read_id(struct flash_bank *bank, uint32_t *id)
 {
 	/* Read JEDEC ID from flash */
 	return spi_dw_read_addr(bank, SPIFLASH_READ_ID, NULL, 0, (uint8_t *)id, 3);
+}
+
+static int spi_dw_chip_erase(struct flash_bank *bank)
+{
+	struct spi_dw_info *spi_dw_info = bank->driver_priv;
+	struct flash_device *fdev = &spi_dw_info->fdev;
+	int rc;
+	uint8_t sr = BIT(0);
+
+	rc = spi_dw_write_addr(bank, fdev->chip_erase_cmd, NULL, 0x0, NULL, 0x0);
+	if (rc != ERROR_OK)
+		return rc;
+	/*
+	 * Wait for SPI flash to clear write in progress bit. OpenOCD does not
+	 * have a method to track which busy bit indicates programming status,
+	 * so we will use bit 0 of SR0 (the most common)
+	 */
+	while (sr & BIT(0)) {
+		rc = spi_dw_read_addr(bank, SPIFLASH_READ_STATUS, NULL, 0x0, &sr, 1);
+		if (rc != ERROR_OK)
+			return rc;
+	}
+
+	return rc;
+}
+
+static int spi_dw_erase_sector(struct flash_bank *bank, unsigned int sector)
+{
+	struct spi_dw_info *spi_dw_info = bank->driver_priv;
+	struct flash_device *fdev = &spi_dw_info->fdev;
+	int rc;
+	const int addr_len = (fdev->erase_cmd == 0xdc) ? 4 : 3;
+	uint8_t sr = BIT(0);
+	uint8_t addr[4];
+
+	swap_addr(sector * fdev->sectorsize, addr_len, addr);
+
+	rc = spi_dw_read_addr(bank, SPIFLASH_READ_STATUS, NULL, 0x0, &sr, 1);
+	LOG_DEBUG("SR reg: 0x%X", sr);
+
+	rc = spi_dw_write_addr(bank, fdev->erase_cmd, addr, addr_len, NULL, 0x0);
+	if (rc != ERROR_OK)
+		return rc;
+	/*
+	 * Wait for SPI flash to clear write in progress bit. OpenOCD does not
+	 * have a method to track which busy bit indicates programming status,
+	 * so we will use bit 0 of SR0 (the most common)
+	 */
+	while (sr & BIT(0)) {
+		LOG_DEBUG("SR reg: 0x%X", sr);
+		rc = spi_dw_read_addr(bank, SPIFLASH_READ_STATUS, NULL, 0x0, &sr, 1);
+		if (rc != ERROR_OK)
+			return rc;
+	}
+
+	return rc;
 }
 
 static int spi_dw_probe(struct flash_bank *bank)
@@ -449,6 +616,10 @@ static int spi_dw_read(struct flash_bank *bank, uint8_t *buffer,
 	int rc;
 	uint8_t addr[4];
 
+	if (!(spi_dw_info->probed)) {
+		LOG_ERROR("Flash bank not probed.");
+		return ERROR_FLASH_BANK_NOT_PROBED;
+	}
 
 	if (count > CTRLR1_NDF_MASK) {
 		/*
@@ -474,6 +645,48 @@ static int spi_dw_read(struct flash_bank *bank, uint8_t *buffer,
 	}
 	return rc;
 }
+
+static int spi_dw_erase(struct flash_bank *bank, unsigned int first,
+			unsigned int last)
+{
+	struct spi_dw_info *spi_dw_info = bank->driver_priv;
+	struct flash_device *fdev = &spi_dw_info->fdev;
+	const uint8_t addr_len = (fdev->erase_cmd == 0xdc) ? 4 : 3;
+	int rc;
+
+	(void)addr_len;
+
+	if ((last < first) || (last >= bank->num_sectors)) {
+		LOG_ERROR("Flash sector invalid");
+		return ERROR_FLASH_SECTOR_INVALID;
+	}
+
+	if (!(spi_dw_info->probed)) {
+		LOG_ERROR("Flash bank not probed.");
+		return ERROR_FLASH_BANK_NOT_PROBED;
+	}
+
+	/* Set write enable */
+	rc = spi_dw_write_addr(bank, SPIFLASH_WRITE_ENABLE, NULL, 0x0, NULL, 0x0);
+	if (rc != ERROR_OK)
+		return rc;
+
+	if ((first == 0) && (last == bank->num_sectors - 1)) {
+		/* Use a bulk erase */
+		rc = spi_dw_chip_erase(bank);
+	} else {
+		for (unsigned int sector = first; sector <= last; sector++) {
+			rc = spi_dw_erase_sector(bank, sector);
+			if (rc != ERROR_OK) {
+				LOG_ERROR("Sector erase failed: %d", rc);
+				break;
+			}
+		}
+	}
+
+	return rc;
+}
+
 
 FLASH_BANK_COMMAND_HANDLER(spi_dw_flash_bank_command)
 {
@@ -509,5 +722,6 @@ struct flash_driver spi_dw_flash = {
 	.probe = spi_dw_probe,
 	.auto_probe = spi_dw_auto_probe,
 	.read = spi_dw_read,
+	.erase = spi_dw_erase,
 	.free_driver_priv = default_flash_free_driver_priv,
 };
