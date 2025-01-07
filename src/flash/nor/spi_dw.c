@@ -355,7 +355,6 @@ static int spi_dw_write_addr(struct flash_bank *bank, uint8_t cmd,
 					 data_len);
 			}
 		}
-		LOG_INFO("write %ld bytes", write_len);
 		/* Now perform a bulk write to the DR array */
 		rc = target_write_memory(bank->target,
 					 spi_dw_info->regs_base + DR0,
@@ -413,6 +412,12 @@ static int spi_dw_chip_erase(struct flash_bank *bank)
 		rc = spi_dw_read_addr(bank, SPIFLASH_READ_STATUS, NULL, 0x0, &sr, 1);
 		if (rc != ERROR_OK)
 			return rc;
+		if (sr & BIT(1)) {
+			LOG_WARNING("SR write enable is still set. "
+				    "Erase operation may have failed");
+			/* Fail here- we can fallback to sector erase */
+			return ERROR_FLASH_SECTOR_NOT_ERASED;
+		}
 	} while (sr & BIT(0));
 
 	return rc;
@@ -441,7 +446,6 @@ static int spi_dw_erase_sector(struct flash_bank *bank, unsigned int sector)
 		rc = spi_dw_read_addr(bank, SPIFLASH_READ_STATUS, NULL, 0x0, &sr, 1);
 		if (rc != ERROR_OK)
 			return rc;
-		LOG_INFO("SR: 0x%X", sr);
 	} while (sr & BIT(0));
 
 	return rc;
@@ -600,7 +604,7 @@ static int spi_dw_probe(struct flash_bank *bank)
 	}
 
 	bank->write_start_alignment = fdev->pagesize;
-	bank->write_end_alignment = fdev->pagesize;
+	bank->write_end_alignment = 0;
 
 	spi_dw_info->probed = true;
 
@@ -683,25 +687,33 @@ static int spi_dw_erase(struct flash_bank *bank, unsigned int first,
 
 
 	if ((first == 0) && (last == bank->num_sectors - 1)) {
+		/* Try bulk erase */
+
 		/* Set write enable */
 		rc = spi_dw_write_addr(bank, SPIFLASH_WRITE_ENABLE, NULL, 0x0,
 				       NULL, 0x0);
 		if (rc != ERROR_OK)
 			return rc;
-		/* Use a bulk erase */
 		rc = spi_dw_chip_erase(bank);
-	} else {
-		for (unsigned int sector = first; sector <= last; sector++) {
-			/* Set write enable */
-			rc = spi_dw_write_addr(bank, SPIFLASH_WRITE_ENABLE, NULL,
-					       0x0, NULL, 0x0);
-			if (rc != ERROR_OK)
-				return rc;
-			rc = spi_dw_erase_sector(bank, sector);
-			if (rc != ERROR_OK) {
-				LOG_ERROR("Sector erase failed: %d", rc);
-				break;
-			}
+		if (rc != ERROR_OK) {
+			LOG_WARNING("Chip erase failed, falling back to sector erase");
+			/* fallthrough to sector erase code */
+		} else {
+			/* Chip erase succeeded */
+			return rc;
+		}
+	}
+
+	for (unsigned int sector = first; sector <= last; sector++) {
+		/* Set write enable */
+		rc = spi_dw_write_addr(bank, SPIFLASH_WRITE_ENABLE, NULL,
+				       0x0, NULL, 0x0);
+		if (rc != ERROR_OK)
+			return rc;
+		rc = spi_dw_erase_sector(bank, sector);
+		if (rc != ERROR_OK) {
+			LOG_ERROR("Sector erase failed: %d", rc);
+			break;
 		}
 	}
 
@@ -723,9 +735,8 @@ static int spi_dw_write(struct flash_bank *bank, const uint8_t *buffer,
 		return ERROR_FLASH_BANK_NOT_PROBED;
 	}
 
-	if (((offset % fdev->pagesize) != 0) ||
-	    ((count % fdev->pagesize) != 0)) {
-		LOG_ERROR("Write offset/size is misaligned");
+	if ((offset % fdev->pagesize) != 0) {
+		LOG_ERROR("Write offset is misaligned");
 		return ERROR_FLASH_DST_BREAKS_ALIGNMENT;
 	}
 
@@ -737,13 +748,8 @@ static int spi_dw_write(struct flash_bank *bank, const uint8_t *buffer,
 				       NULL, 0x0);
 		if (rc != ERROR_OK)
 			return rc;
-		rc = spi_dw_read_addr(bank, SPIFLASH_READ_STATUS, NULL,
-				      0x0, &sr, 1);
-		if (rc != ERROR_OK)
-			return rc;
-		LOG_INFO("SR: 0x%X", sr);
 
-		/* Program sectors. */
+		/* Program sector */
 		swap_addr(offset + i, addr_len, addr);
 
 		rc = spi_dw_write_addr(bank, fdev->pprog_cmd, addr, addr_len,
@@ -762,7 +768,10 @@ static int spi_dw_write(struct flash_bank *bank, const uint8_t *buffer,
 					      0x0, &sr, 1);
 			if (rc != ERROR_OK)
 				return rc;
-			LOG_INFO("SR: 0x%X", sr);
+			if (sr & BIT(1)) {
+				LOG_WARNING("SR write enable is still set. "
+					    "program operation may have failed");
+			}
 		} while (sr & BIT(0));
 	}
 
