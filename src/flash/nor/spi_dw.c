@@ -92,6 +92,12 @@
 
 #define SPI_DW_DR_SIZE 36
 
+/*
+ * Offset at which SPI driver should log read/write progress. Useful for
+ * large reads/programs to verify progress has not stalled
+ */
+#define SPI_DW_PROGRESS_OFFSET 0x4000
+
 struct spi_dw_info {
 	uint32_t regs_base;
 	uint16_t sclk_div;
@@ -237,7 +243,7 @@ static int spi_dw_read_addr(struct flash_bank *bank, uint8_t cmd,
 			goto out;
 		for (size_t i = 0; i < rd_len; i++) {
 			data_buf[rd_offset++] = int_buf[i] & 0xFF;
-			if ((rd_offset % 0x10000) == 0) {
+			if ((rd_offset % SPI_DW_PROGRESS_OFFSET) == 0) {
 				LOG_INFO("Reading offset 0x%lx/0x%lx", rd_offset,
 					 data_len);
 			}
@@ -275,7 +281,7 @@ out:
 /* Helper to write command and address, then write data */
 static int spi_dw_write_addr(struct flash_bank *bank, uint8_t cmd,
 			     uint8_t *addr_buf, size_t addr_len,
-			     uint8_t *data_buf, size_t data_len)
+			     const uint8_t *data_buf, size_t data_len)
 {
 	struct spi_dw_info *spi_dw_info = bank->driver_priv;
 	uint32_t int_buf[SPI_DW_DR_SIZE];
@@ -320,6 +326,7 @@ static int spi_dw_write_addr(struct flash_bank *bank, uint8_t cmd,
 			goto out;
 	}
 
+
 	/* Set SER to enable chip select and start transfer */
 	rc = spi_dw_write_reg(bank, SER, 0x1);
 	if (rc != ERROR_OK)
@@ -339,10 +346,16 @@ static int spi_dw_write_addr(struct flash_bank *bank, uint8_t cmd,
 		rc = spi_dw_read_reg(bank, TXFLR, &reg);
 		if (rc != ERROR_OK)
 			goto out;
-		write_len = spi_dw_info->tx_abw - reg;
-		for (size_t i = 0; i < write_len; i++) {
+		write_len = MIN(spi_dw_info->tx_abw - reg, (data_len - write_offset));
+		for (size_t i = 0; i < write_len;) {
 			int_buf[i] = data_buf[i + write_offset];
+			i++;
+			if (((i + write_offset) % SPI_DW_PROGRESS_OFFSET) == 0) {
+				LOG_INFO("Writing offset 0x%lx/0x%lx", i + write_offset,
+					 data_len);
+			}
 		}
+		LOG_INFO("write %ld bytes", write_len);
 		/* Now perform a bulk write to the DR array */
 		rc = target_write_memory(bank->target,
 					 spi_dw_info->regs_base + DR0,
@@ -386,7 +399,7 @@ static int spi_dw_chip_erase(struct flash_bank *bank)
 	struct spi_dw_info *spi_dw_info = bank->driver_priv;
 	struct flash_device *fdev = &spi_dw_info->fdev;
 	int rc;
-	uint8_t sr = BIT(0);
+	uint8_t sr;
 
 	rc = spi_dw_write_addr(bank, fdev->chip_erase_cmd, NULL, 0x0, NULL, 0x0);
 	if (rc != ERROR_OK)
@@ -396,11 +409,11 @@ static int spi_dw_chip_erase(struct flash_bank *bank)
 	 * have a method to track which busy bit indicates programming status,
 	 * so we will use bit 0 of SR0 (the most common)
 	 */
-	while (sr & BIT(0)) {
+	do {
 		rc = spi_dw_read_addr(bank, SPIFLASH_READ_STATUS, NULL, 0x0, &sr, 1);
 		if (rc != ERROR_OK)
 			return rc;
-	}
+	} while (sr & BIT(0));
 
 	return rc;
 }
@@ -411,13 +424,10 @@ static int spi_dw_erase_sector(struct flash_bank *bank, unsigned int sector)
 	struct flash_device *fdev = &spi_dw_info->fdev;
 	int rc;
 	const int addr_len = (fdev->erase_cmd == 0xdc) ? 4 : 3;
-	uint8_t sr = BIT(0);
+	uint8_t sr;
 	uint8_t addr[4];
 
 	swap_addr(sector * fdev->sectorsize, addr_len, addr);
-
-	rc = spi_dw_read_addr(bank, SPIFLASH_READ_STATUS, NULL, 0x0, &sr, 1);
-	LOG_DEBUG("SR reg: 0x%X", sr);
 
 	rc = spi_dw_write_addr(bank, fdev->erase_cmd, addr, addr_len, NULL, 0x0);
 	if (rc != ERROR_OK)
@@ -427,12 +437,12 @@ static int spi_dw_erase_sector(struct flash_bank *bank, unsigned int sector)
 	 * have a method to track which busy bit indicates programming status,
 	 * so we will use bit 0 of SR0 (the most common)
 	 */
-	while (sr & BIT(0)) {
-		LOG_DEBUG("SR reg: 0x%X", sr);
+	do {
 		rc = spi_dw_read_addr(bank, SPIFLASH_READ_STATUS, NULL, 0x0, &sr, 1);
 		if (rc != ERROR_OK)
 			return rc;
-	}
+		LOG_INFO("SR: 0x%X", sr);
+	} while (sr & BIT(0));
 
 	return rc;
 }
@@ -571,8 +581,6 @@ static int spi_dw_probe(struct flash_bank *bank)
 	}
 
 	bank->size = fdev->size_in_bytes;
-	bank->write_start_alignment = FLASH_WRITE_ALIGN_SECTOR;
-	bank->write_end_alignment = FLASH_WRITE_ALIGN_SECTOR;
 
 	/* Create sectors array */
 	bank->num_sectors = fdev->size_in_bytes / fdev->sectorsize;
@@ -590,6 +598,9 @@ static int spi_dw_probe(struct flash_bank *bank)
 		bank->sectors[sector].is_erased = -1;
 		bank->sectors[sector].is_protected = 0;
 	}
+
+	bank->write_start_alignment = fdev->pagesize;
+	bank->write_end_alignment = fdev->pagesize;
 
 	spi_dw_info->probed = true;
 
@@ -620,6 +631,8 @@ static int spi_dw_read(struct flash_bank *bank, uint8_t *buffer,
 		LOG_ERROR("Flash bank not probed.");
 		return ERROR_FLASH_BANK_NOT_PROBED;
 	}
+
+	LOG_DEBUG("Read offset %d, len %d", offset, count);
 
 	if (count > CTRLR1_NDF_MASK) {
 		/*
@@ -666,16 +679,24 @@ static int spi_dw_erase(struct flash_bank *bank, unsigned int first,
 		return ERROR_FLASH_BANK_NOT_PROBED;
 	}
 
-	/* Set write enable */
-	rc = spi_dw_write_addr(bank, SPIFLASH_WRITE_ENABLE, NULL, 0x0, NULL, 0x0);
-	if (rc != ERROR_OK)
-		return rc;
+	LOG_DEBUG("Erase sector %d-%d", first, last);
+
 
 	if ((first == 0) && (last == bank->num_sectors - 1)) {
+		/* Set write enable */
+		rc = spi_dw_write_addr(bank, SPIFLASH_WRITE_ENABLE, NULL, 0x0,
+				       NULL, 0x0);
+		if (rc != ERROR_OK)
+			return rc;
 		/* Use a bulk erase */
 		rc = spi_dw_chip_erase(bank);
 	} else {
 		for (unsigned int sector = first; sector <= last; sector++) {
+			/* Set write enable */
+			rc = spi_dw_write_addr(bank, SPIFLASH_WRITE_ENABLE, NULL,
+					       0x0, NULL, 0x0);
+			if (rc != ERROR_OK)
+				return rc;
 			rc = spi_dw_erase_sector(bank, sector);
 			if (rc != ERROR_OK) {
 				LOG_ERROR("Sector erase failed: %d", rc);
@@ -685,6 +706,98 @@ static int spi_dw_erase(struct flash_bank *bank, unsigned int first,
 	}
 
 	return rc;
+}
+
+static int spi_dw_write(struct flash_bank *bank, const uint8_t *buffer,
+			uint32_t offset, uint32_t count)
+{
+	struct spi_dw_info *spi_dw_info = bank->driver_priv;
+	struct flash_device *fdev = &spi_dw_info->fdev;
+	uint8_t addr[4];
+	const int addr_len = (fdev->pprog_cmd == 0x12) ? 4 : 3;
+	int rc;
+	uint8_t sr;
+
+	if (!(spi_dw_info->probed)) {
+		LOG_ERROR("Flash bank not probed.");
+		return ERROR_FLASH_BANK_NOT_PROBED;
+	}
+
+	if (((offset % fdev->pagesize) != 0) ||
+	    ((count % fdev->pagesize) != 0)) {
+		LOG_ERROR("Write offset/size is misaligned");
+		return ERROR_FLASH_DST_BREAKS_ALIGNMENT;
+	}
+
+	LOG_DEBUG("Write offset %d, len %d", offset, count);
+
+	for (uint32_t i = 0; i < count; i += fdev->pagesize) {
+		/* Set write enable */
+		rc = spi_dw_write_addr(bank, SPIFLASH_WRITE_ENABLE, NULL, 0x0,
+				       NULL, 0x0);
+		if (rc != ERROR_OK)
+			return rc;
+		rc = spi_dw_read_addr(bank, SPIFLASH_READ_STATUS, NULL,
+				      0x0, &sr, 1);
+		if (rc != ERROR_OK)
+			return rc;
+		LOG_INFO("SR: 0x%X", sr);
+
+		/* Program sectors. */
+		swap_addr(offset + i, addr_len, addr);
+
+		rc = spi_dw_write_addr(bank, fdev->pprog_cmd, addr, addr_len,
+				       &buffer[i], fdev->pagesize);
+		if (rc != ERROR_OK)
+			return rc;
+
+		/*
+		 * Wait for SPI flash to clear write in progress bit. OpenOCD
+		 * does not have a method to track which busy bit indicates
+		 * programming status, so we will use bit 0 of SR0 (the most
+		 * common)
+		 */
+		do {
+			rc = spi_dw_read_addr(bank, SPIFLASH_READ_STATUS, NULL,
+					      0x0, &sr, 1);
+			if (rc != ERROR_OK)
+				return rc;
+			LOG_INFO("SR: 0x%X", sr);
+		} while (sr & BIT(0));
+	}
+
+	return rc;
+}
+
+static int spi_dw_protect(struct flash_bank *bank, int set, unsigned int first,
+			  unsigned int last)
+{
+	for (unsigned int sector = first; sector <= last; sector++)
+		bank->sectors[sector].is_protected = set;
+	return ERROR_OK;
+}
+
+static int spi_dw_info(struct flash_bank *bank, struct command_invocation *cmd)
+{
+	struct spi_dw_info *spi_dw_info = bank->driver_priv;
+	struct flash_device *fdev = &spi_dw_info->fdev;
+
+	if (!(spi_dw_info->probed)) {
+		LOG_ERROR("Flash bank not probed.");
+		return ERROR_FLASH_BANK_NOT_PROBED;
+	}
+
+	command_print_sameline(cmd, "SPI DW connected to flash \'%s\', "
+			       "device id = 0x%06" PRIx32 ",flash size = %" PRIu32
+			       " bytes (read = 0x%02" PRIx8 ", pprog = 0x%02" PRIx8
+			       ", erase = 0x%02" PRIx8 ", chip_erase = 0x%02" PRIx8
+	 		       ", pagesize = %" PRIu32 ", sectorsize = %" PRIu32 ")",
+			       fdev->name, fdev->device_id, fdev->size_in_bytes,
+			       fdev->read_cmd, fdev->pprog_cmd, fdev->erase_cmd,
+			       fdev->chip_erase_cmd, fdev->pagesize,
+			       fdev->sectorsize);
+
+	return ERROR_OK;
 }
 
 
@@ -723,5 +836,9 @@ struct flash_driver spi_dw_flash = {
 	.auto_probe = spi_dw_auto_probe,
 	.read = spi_dw_read,
 	.erase = spi_dw_erase,
+	.write = spi_dw_write,
+	.protect = spi_dw_protect,
+	.info = spi_dw_info,
+	.erase_check = default_flash_blank_check,
 	.free_driver_priv = default_flash_free_driver_priv,
 };
