@@ -101,10 +101,12 @@
 struct spi_dw_info {
 	uint32_t regs_base;
 	uint16_t sclk_div;
+	uint8_t dr_reg_cnt;
 	bool probed;
 	struct flash_device fdev;
 	uint32_t tx_abw;
 	uint32_t rx_abw;
+	uint32_t progress_offset;
 };
 
 /* Helper function to write to IP register */
@@ -218,7 +220,7 @@ static int spi_dw_read_addr(struct flash_bank *bank, uint8_t cmd,
 		 * Therefore, we *must* wait for the RX FIFO to have at least
 		 * 36 entries if we want all 36 bytes to be valid.
 		 */
-		rd_len = MIN(SPI_DW_DR_SIZE, reg);
+		rd_len = MIN(spi_dw_info->dr_reg_cnt, reg);
 
 		rc = spi_dw_read_reg(bank, SR, &reg);
 		if (rc != ERROR_OK)
@@ -231,19 +233,22 @@ static int spi_dw_read_addr(struct flash_bank *bank, uint8_t cmd,
 		}
 
 		if ((rd_len != (data_len - rd_offset)) &&
-		    (rd_len != SPI_DW_DR_SIZE)) {
+		    (rd_len != spi_dw_info->dr_reg_cnt)) {
 			continue;
 		}
+
+		/* Send keep alive packet here */
+		keep_alive();
 
 		/* Read data clocked in */
 		rc = target_read_memory(bank->target,
 					spi_dw_info->regs_base + DR0, 0x4,
-					SPI_DW_DR_SIZE, (uint8_t *)int_buf);
+					spi_dw_info->dr_reg_cnt, (uint8_t *)int_buf);
 		if (rc != ERROR_OK)
 			goto out;
 		for (size_t i = 0; i < rd_len; i++) {
 			data_buf[rd_offset++] = int_buf[i] & 0xFF;
-			if ((rd_offset % SPI_DW_PROGRESS_OFFSET) == 0) {
+			if ((rd_offset % spi_dw_info->progress_offset) == 0) {
 				LOG_INFO("Reading offset 0x%lx/0x%lx", rd_offset,
 					 data_len);
 			}
@@ -347,13 +352,8 @@ static int spi_dw_write_addr(struct flash_bank *bank, uint8_t cmd,
 		if (rc != ERROR_OK)
 			goto out;
 		write_len = MIN(spi_dw_info->tx_abw - reg, (data_len - write_offset));
-		for (size_t i = 0; i < write_len;) {
+		for (size_t i = 0; i < write_len; i++) {
 			int_buf[i] = data_buf[i + write_offset];
-			i++;
-			if (((i + write_offset) % SPI_DW_PROGRESS_OFFSET) == 0) {
-				LOG_INFO("Writing offset 0x%lx/0x%lx", i + write_offset,
-					 data_len);
-			}
 		}
 		/* Now perform a bulk write to the DR array */
 		rc = target_write_memory(bank->target,
@@ -752,6 +752,12 @@ static int spi_dw_write(struct flash_bank *bank, const uint8_t *buffer,
 		/* Program sector */
 		swap_addr(offset + i, addr_len, addr);
 
+		if (((i % spi_dw_info->progress_offset) == 0) && i != 0) {
+			LOG_INFO("Writing offset 0x%x/0x%x", i, count);
+		}
+		/* Send keep alive packet here */
+		keep_alive();
+
 		rc = spi_dw_write_addr(bank, fdev->pprog_cmd, addr, addr_len,
 				       &buffer[i], fdev->pagesize);
 		if (rc != ERROR_OK)
@@ -814,6 +820,8 @@ FLASH_BANK_COMMAND_HANDLER(spi_dw_flash_bank_command)
 {
 	struct spi_dw_info *spi_dw_info;
 	uint32_t regs_base;
+	uint32_t progress_offset = SPI_DW_PROGRESS_OFFSET;
+	uint8_t dr_reg_cnt = SPI_DW_DR_SIZE;
 	uint16_t sclk_div;
 
 	if (CMD_ARGC < 8)
@@ -821,6 +829,19 @@ FLASH_BANK_COMMAND_HANDLER(spi_dw_flash_bank_command)
 
 	COMMAND_PARSE_NUMBER(u32, CMD_ARGV[6], regs_base);
 	COMMAND_PARSE_NUMBER(u16, CMD_ARGV[7], sclk_div);
+
+	if (CMD_ARGC >= 9) {
+		COMMAND_PARSE_NUMBER(u32, CMD_ARGV[8], progress_offset);
+	}
+
+	if (CMD_ARGC >= 10) {
+		COMMAND_PARSE_NUMBER(u8, CMD_ARGV[9], dr_reg_cnt);
+		if (dr_reg_cnt > SPI_DW_DR_SIZE) {
+			LOG_ERROR("Error, SPI DW can only have up to %d data "
+				  "registers", SPI_DW_DR_SIZE);
+			return ERROR_FAIL;
+		}
+	}
 
 	spi_dw_info = malloc(sizeof(struct spi_dw_info));
 	if (spi_dw_info == NULL) {
@@ -832,6 +853,8 @@ FLASH_BANK_COMMAND_HANDLER(spi_dw_flash_bank_command)
 
 	spi_dw_info->regs_base = regs_base;
 	spi_dw_info->sclk_div = sclk_div;
+	spi_dw_info->progress_offset = progress_offset;
+	spi_dw_info->dr_reg_cnt = dr_reg_cnt;
 	spi_dw_info->probed = false;
 
 
