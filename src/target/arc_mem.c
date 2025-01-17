@@ -162,8 +162,7 @@ int arc_mem_write(struct target *target, target_addr_t address, uint32_t size,
 		address, size, count);
 
 	if (target->state != TARGET_HALTED) {
-		LOG_WARNING("target not halted");
-		return ERROR_TARGET_NOT_HALTED;
+		LOG_DEBUG("target not halted");
 	}
 
 	/* sanitize arguments */
@@ -247,8 +246,7 @@ int arc_mem_read(struct target *target, target_addr_t address, uint32_t size,
 			", count=%" PRIu32, address, size, count);
 
 	if (target->state != TARGET_HALTED) {
-		LOG_WARNING("target not halted");
-		return ERROR_TARGET_NOT_HALTED;
+		LOG_DEBUG("target not halted");
 	}
 
 	/* Sanitize arguments */
