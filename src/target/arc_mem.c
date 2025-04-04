@@ -24,9 +24,10 @@ static bool arc_mem_is_slow_memory(struct arc_common *arc, uint32_t addr,
 	 * dccm_end will be 0. */
 	assert(addr_end >= addr || addr_end == 0);
 
-	return !((addr >= arc->dccm_start && addr_end <= arc->dccm_end) ||
+	return (arc->slow_mem_en &&
+		(!((addr >= arc->dccm_start && addr_end <= arc->dccm_end) ||
 		(addr >= arc->iccm0_start && addr_end <= arc->iccm0_end) ||
-		(addr >= arc->iccm1_start && addr_end <= arc->iccm1_end));
+		(addr >= arc->iccm1_start && addr_end <= arc->iccm1_end))));
 }
 
 /* Write word at word-aligned address */

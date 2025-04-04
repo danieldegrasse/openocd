@@ -170,6 +170,7 @@ static int arc_init_arch_info(struct target *target, struct arc_common *arc,
 	arc->last_general_reg = ULONG_MAX;
 	arc->pc_index_in_cache = ULONG_MAX;
 	arc->debug_index_in_cache = ULONG_MAX;
+	arc->slow_mem_en = true;
 
 	return ERROR_OK;
 }

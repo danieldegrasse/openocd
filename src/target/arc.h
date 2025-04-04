@@ -242,6 +242,9 @@ struct arc_common {
 	unsigned int actionpoints_num;
 	unsigned int actionpoints_num_avail;
 	struct arc_actionpoint *actionpoints_list;
+
+	/* Should we issue extra JTAG address writes for slow memory? */
+	bool slow_mem_en;
 };
 
 /* Borrowed from nds32.h */

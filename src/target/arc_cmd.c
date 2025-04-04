@@ -30,6 +30,12 @@ static int arc_cmd_jim_get_uint32(struct jim_getopt_info *goi, uint32_t *value)
 	return JIM_OK;
 }
 
+static int arc_cmd_jim_get_string(struct jim_getopt_info *goi, const char **str, int *len)
+{
+	JIM_CHECK_RETVAL(jim_getopt_string(goi, str, len));
+	return JIM_OK;
+}
+
 enum add_reg_types {
 	CFG_ADD_REG_TYPE_FLAG,
 	CFG_ADD_REG_TYPE_STRUCT,
@@ -442,6 +448,54 @@ static int jim_arc_set_core_reg(Jim_Interp *interp, int argc, Jim_Obj * const *a
 	return ERROR_OK;
 }
 
+/**
+ * Enable/Disable ARC slow memory workaround in arc_jtag.c
+ */
+static int jim_arc_disable_slow_mem(Jim_Interp *interp, int argc, Jim_Obj * const *argv)
+{
+	struct command_context *context;
+	struct target *target;
+	struct jim_getopt_info goi;
+	const char *onoff;
+	int strlen;
+
+	JIM_CHECK_RETVAL(jim_getopt_setup(&goi, interp, argc-1, argv+1));
+
+	if (goi.argc != 1) {
+		Jim_SetResultFormatted(goi.interp,
+			"usage: %s <on/off>", Jim_GetString(argv[0], NULL));
+		return JIM_ERR;
+	}
+
+	context = current_command_context(interp);
+	assert(context);
+
+	target = get_current_target(context);
+	if (!target) {
+		Jim_SetResultFormatted(goi.interp, "No current target");
+		return JIM_ERR;
+	}
+
+	/* Register number */
+	JIM_CHECK_RETVAL(arc_cmd_jim_get_string(&goi, &onoff, &strlen));
+
+	struct arc_common *arc = target_to_arc(target);
+	assert(arc);
+
+	if (strncmp(onoff, "on", strlen) == 0) {
+		/* Enable slow memory */
+		arc->slow_mem_en = true;
+	} else if (strncmp(onoff, "off", strlen) == 0) {
+		/* Disable slow memory */
+		arc->slow_mem_en = false;
+	} else {
+		Jim_SetResultFormatted(goi.interp, "Invalid value, need 'on' or 'off'");
+		return JIM_ERR;
+	}
+
+	return ERROR_OK;
+}
+
 static const struct command_registration arc_jtag_command_group[] = {
 	{
 		.name = "get-aux-reg",
@@ -482,6 +536,15 @@ static const struct command_registration arc_jtag_command_group[] = {
 			"and thus is unsafe and can have unexpected consequences. "
 			"Use at your own risk.",
 		.usage = "<regnum> [<value>]"
+	},
+	{
+		.name = "set-slow-mem",
+		.jim_handler = jim_arc_disable_slow_mem,
+		.mode = COMMAND_CONFIG,
+		.help = "Enable/Disable slow memory within ARC. Slow memory"
+			"requires additional JTAG transactions in order to"
+			"properly read, at the cost of performance.",
+		.usage = "<on/off>",
 	},
 	COMMAND_REGISTRATION_DONE
 };
